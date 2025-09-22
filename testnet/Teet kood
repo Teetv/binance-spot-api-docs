@@ -1,0 +1,114 @@
+import ccxt
+import time
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import csv
+import os
+
+# --- KONFIG ---
+API_KEY = "SINU_BYBIT_TESTNET_KEY"
+API_SECRET = "SINU_BYBIT_TESTNET_SECRET"
+SYMBOL = "BTC/USDT:USDT"   # Bybit Perpetual
+TIMEFRAME = "1m"
+LEVERAGE = 3
+MARGIN_PER_TRADE = 50      # USD marginaali per trade
+SMA_SHORT = 10
+SMA_LONG = 30
+STOP_LOSS_PCT = 0.02       # 2% marginaalist
+FEE_PCT = 0.00075
+SLIPPAGE_PCT = 0.0005
+LOG_FILE = "trade_log.csv"
+
+# --- ÜHENDUS ---
+exchange = ccxt.bybit({
+    "apiKey": API_KEY,
+    "secret": API_SECRET,
+    "enableRateLimit": True,
+    "options": {"defaultType": "future"},
+})
+exchange.set_sandbox_mode(True)  # TESTNET
+
+# positsiooni hoidja
+position = None
+cash = 10000  # paper balance
+
+# --- Logifaili ettevalmistus ---
+if not os.path.exists(LOG_FILE):
+    with open(LOG_FILE, mode="w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["time", "action", "price", "amount", "pnl", "cash"])
+
+def log_trade(action, price, amt, pnl, cash):
+    with open(LOG_FILE, mode="a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([datetime.now().isoformat(), action, price, amt, pnl, cash])
+
+def fetch_data():
+    ohlcv = exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=200)
+    df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
+    df["dt"] = pd.to_datetime(df["ts"], unit="ms")
+    df.set_index("dt", inplace=True)
+    return df
+
+def check_signals(df):
+    df["sma_short"] = df["close"].rolling(SMA_SHORT).mean()
+    df["sma_long"] = df["close"].rolling(SMA_LONG).mean()
+    if df["sma_short"].iloc[-2] <= df["sma_long"].iloc[-2] and df["sma_short"].iloc[-1] > df["sma_long"].iloc[-1]:
+        return "buy"
+    if df["sma_short"].iloc[-2] >= df["sma_long"].iloc[-2] and df["sma_short"].iloc[-1] < df["sma_long"].iloc[-1]:
+        return "sell"
+    return None
+
+def place_market_order(side, amount):
+    try:
+        order = exchange.create_market_order(SYMBOL, side, amount)
+        print(f"[{datetime.now()}] Market {side} {amount} {SYMBOL}")
+        return order
+    except Exception as e:
+        print("Order error:", e)
+
+while True:
+    df = fetch_data()
+    price = df["close"].iloc[-1]
+    signal = check_signals(df)
+
+    # BUY signaal
+    if signal == "buy" and position is None and cash >= MARGIN_PER_TRADE:
+        exposure = MARGIN_PER_TRADE * LEVERAGE
+        amt = exposure / price
+        margin = MARGIN_PER_TRADE
+        cash -= margin
+        position = {"amt": amt, "entry": price, "margin": margin}
+        place_market_order("buy", amt)
+        log_trade("buy", price, amt, 0, cash)
+
+    # SELL signaal
+    elif signal == "sell" and position is not None:
+        amt = position["amt"]
+        proceeds = amt * price
+        fee = proceeds * FEE_PCT
+        slip = proceeds * SLIPPAGE_PCT
+        pnl = proceeds - (amt * position["entry"]) - fee - slip
+        cash += position["margin"] + pnl
+        print(f"[{datetime.now()}] SELL signal: closed pos, PnL={pnl:.2f}, cash={cash:.2f}")
+        place_market_order("sell", amt)
+        log_trade("sell", price, amt, pnl, cash)
+        position = None
+
+    # STOP-LOSS kontroll
+    if position is not None:
+        amt = position["amt"]
+        unrealized = (amt * price) - (amt * position["entry"])
+        if unrealized < - STOP_LOSS_PCT * position["margin"]:
+            proceeds = amt * price
+            fee = proceeds * FEE_PCT
+            slip = proceeds * SLIPPAGE_PCT
+            pnl = proceeds - (amt * position["entry"]) - fee - slip
+            cash += position["margin"] + pnl
+            print(f"[{datetime.now()}] STOP-LOSS: pos closed at {price}, PnL={pnl:.2f}, cash={cash:.2f}")
+            place_market_order("sell", amt)
+            log_trade("stoploss", price, amt, pnl, cash)
+            position = None
+
+    time.sleep(60)  # töötab 1-minuti küünaldega
